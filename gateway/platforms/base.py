@@ -81,9 +81,18 @@ def _reply_anchor_for_event(event) -> str | None:
         return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "telegram" and thread_id:
         return None
-    if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
-        return getattr(event, "reply_to_message_id", None)
+    if platform == "feishu":
+        if not thread_id:
+            return None
+        return getattr(event, "reply_to_message_id", None) or getattr(event, "message_id", None)
     return getattr(event, "message_id", None)
+
+
+def _stream_reply_anchor_for_source(source, event_message_id: str | None) -> str | None:
+    """Return the reply anchor a streaming first chunk should use."""
+    if _platform_name(getattr(source, "platform", None)) == "feishu" and not getattr(source, "thread_id", None):
+        return None
+    return event_message_id
 
 
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:

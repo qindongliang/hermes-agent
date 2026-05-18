@@ -160,6 +160,78 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def test_feishu_plain_group_response_has_no_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            _reply_anchor_for_event,
+        )
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="@项目经理pm 联调测试",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                chat_type="group",
+            ),
+            message_id="om_trigger",
+        )
+
+        self.assertIsNone(_reply_anchor_for_event(event))
+
+    def test_feishu_thread_response_keeps_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import (
+            MessageEvent,
+            MessageType,
+            _reply_anchor_for_event,
+        )
+        from gateway.session import SessionSource
+
+        event = MessageEvent(
+            text="@项目经理pm 联调测试",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_chat",
+                chat_type="group",
+                thread_id="omt_thread",
+            ),
+            message_id="om_trigger",
+        )
+
+        self.assertEqual(_reply_anchor_for_event(event), "om_trigger")
+
+    def test_feishu_plain_group_streaming_response_has_no_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import _stream_reply_anchor_for_source
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+        )
+
+        self.assertIsNone(_stream_reply_anchor_for_source(source, "om_trigger"))
+
+    def test_feishu_thread_streaming_response_keeps_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import _stream_reply_anchor_for_source
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_chat",
+            chat_type="group",
+            thread_id="omt_thread",
+        )
+
+        self.assertEqual(_stream_reply_anchor_for_source(source, "om_trigger"), "om_trigger")
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
