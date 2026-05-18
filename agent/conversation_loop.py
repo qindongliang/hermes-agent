@@ -82,6 +82,36 @@ def _ra():
     return run_agent
 
 
+def _stored_system_prompt_stale_for_soul(agent: Any, stored_prompt: str) -> bool:
+    """Return True when a persisted prompt no longer matches SOUL.md.
+
+    Gateway profiles often create a fresh AIAgent for each incoming message and
+    restore the frozen prompt from the session DB for cache stability. That is
+    correct for normal turns, but profile identity edits such as SOUL.md changes
+    must take effect without forcing users to abandon the current chat session.
+    """
+    if not stored_prompt:
+        return False
+
+    should_load_soul = (
+        getattr(agent, "load_soul_identity", False)
+        or not getattr(agent, "skip_context_files", False)
+    )
+    if not should_load_soul:
+        return False
+
+    try:
+        current_soul = _ra().load_soul_md()
+    except Exception as exc:
+        logger.debug("Could not load SOUL.md while validating stored system prompt: %s", exc)
+        return False
+
+    if not current_soul:
+        return False
+
+    return current_soul not in stored_prompt
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -314,6 +344,7 @@ def run_conversation(
     # prefix cache.
     if agent._cached_system_prompt is None:
         stored_prompt = None
+        stored_prompt_stale = False
         if conversation_history and agent._session_db:
             try:
                 session_row = agent._session_db.get_session(agent.session_id)
@@ -323,26 +354,37 @@ def run_conversation(
                 pass  # Fall through to build fresh
 
         if stored_prompt:
-            # Continuing session — reuse the exact system prompt from
-            # the previous turn so the Anthropic cache prefix matches.
-            agent._cached_system_prompt = stored_prompt
-        else:
-            # First turn of a new session — build from scratch.
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
-            # Plugin hook: on_session_start
-            # Fired once when a brand-new session is created (not on
-            # continuation).  Plugins can use this to initialise
-            # session-scoped state (e.g. warm a memory cache).
-            try:
-                from hermes_cli.plugins import invoke_hook as _invoke_hook
-                _invoke_hook(
-                    "on_session_start",
-                    session_id=agent.session_id,
-                    model=agent.model,
-                    platform=getattr(agent, "platform", None) or "",
+            if _stored_system_prompt_stale_for_soul(agent, stored_prompt):
+                stored_prompt_stale = True
+                logger.info(
+                    "Stored system prompt for session %s is stale relative to SOUL.md; rebuilding",
+                    agent.session_id,
                 )
-            except Exception as exc:
-                logger.warning("on_session_start hook failed: %s", exc)
+            else:
+                # Continuing session — reuse the exact system prompt from
+                # the previous turn so the Anthropic cache prefix matches.
+                agent._cached_system_prompt = stored_prompt
+
+        if agent._cached_system_prompt is None:
+            # First turn of a new session, or a continuation whose persisted
+            # prompt no longer matches the profile identity files.
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+
+            if not stored_prompt_stale:
+                # Plugin hook: on_session_start
+                # Fired once when a brand-new session is created (not on
+                # continuation).  Plugins can use this to initialise
+                # session-scoped state (e.g. warm a memory cache).
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _invoke_hook(
+                        "on_session_start",
+                        session_id=agent.session_id,
+                        model=agent.model,
+                        platform=getattr(agent, "platform", None) or "",
+                    )
+                except Exception as exc:
+                    logger.warning("on_session_start hook failed: %s", exc)
 
             # Store the system prompt snapshot in SQLite
             if agent._session_db:
