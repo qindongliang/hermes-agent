@@ -1289,6 +1289,10 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        # Feishu bot-to-bot delegations waiting for a human to approve tool use.
+        # Keyed by chat/thread so a human in the same group can approve even
+        # when group sessions are isolated per sender.
+        self._pending_feishu_bot_delegations: Dict[str, Dict[str, Any]] = {}
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -5870,6 +5874,259 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    @staticmethod
+    def _feishu_bot_delegation_key(source: SessionSource) -> str:
+        """Chat/thread scoped key for human approval of bot-to-bot delegations."""
+        thread_id = getattr(source, "thread_id", None) or ""
+        return f"feishu:{source.chat_id or ''}:{thread_id}"
+
+    @staticmethod
+    def _match_feishu_bot_delegation_approval_choice(event: MessageEvent) -> Optional[str]:
+        """Return approve/cancel choice for a human reply, or None."""
+        raw = (event.text or "").strip().lower()
+        cmd = event.get_command()
+        if cmd in {"approve", "yes", "ok", "confirm"}:
+            return "approve"
+        if cmd in {"deny", "no", "cancel", "nevermind"}:
+            return "cancel"
+        normalized = raw.replace(" ", "")
+        if normalized in {
+            "approve",
+            "yes",
+            "ok",
+            "confirm",
+            "同意",
+            "批准",
+            "可以",
+            "开始",
+            "开始排查",
+            "允许",
+            "准了",
+        }:
+            return "approve"
+        if normalized in {
+            "deny",
+            "no",
+            "cancel",
+            "nevermind",
+            "拒绝",
+            "不同意",
+            "取消",
+            "不要",
+            "先别",
+            "别动",
+        }:
+            return "cancel"
+        return None
+
+    def _pending_feishu_bot_delegations_map(self) -> Dict[str, Dict[str, Any]]:
+        pending = getattr(self, "_pending_feishu_bot_delegations", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._pending_feishu_bot_delegations = pending
+        return pending
+
+    def _clear_stale_feishu_bot_delegation(self, key: str, *, timeout: float = 300.0) -> bool:
+        pending = self._pending_feishu_bot_delegations_map()
+        entry = pending.get(key)
+        if not entry:
+            return False
+        if time.time() - float(entry.get("created_at", 0) or 0) > timeout:
+            pending.pop(key, None)
+            return True
+        return False
+
+    def _ambient_gate_timeout_notice_map(self) -> Dict[str, float]:
+        notices = getattr(self, "_ambient_gate_timeout_notices", None)
+        if not isinstance(notices, dict):
+            notices = {}
+            self._ambient_gate_timeout_notices = notices
+        return notices
+
+    @staticmethod
+    def _ambient_gate_timeout_notice_key(event: MessageEvent) -> str:
+        source = event.source
+        message_id = getattr(event, "message_id", None) or ""
+        if not message_id:
+            import hashlib as _hashlib
+
+            message_id = _hashlib.sha1((event.text or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+        thread_id = getattr(source, "thread_id", None) or ""
+        return f"{source.platform.value}:{source.chat_id or ''}:{thread_id}:{message_id}"
+
+    async def _maybe_send_ambient_gate_timeout_notice(
+        self,
+        event: MessageEvent,
+        decision: Any,
+        *,
+        min_interval_seconds: float = 60.0,
+    ) -> None:
+        """Tell the chat when the ambient relevance gate timed out."""
+        if not bool(getattr(decision, "is_timeout_error", False)):
+            return
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if adapter is None or not source.chat_id:
+            return
+        key = self._ambient_gate_timeout_notice_key(event)
+        notices = self._ambient_gate_timeout_notice_map()
+        now = time.time()
+        previous = float(notices.get(key, 0.0) or 0.0)
+        if previous and now - previous < max(0.0, float(min_interval_seconds or 0.0)):
+            return
+        notices[key] = now
+
+        profile_name = self._active_profile_name()
+        content = f"{profile_name}：相关性判断超时，未启动处理。需要我介入请 @我。"
+        metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+        try:
+            await adapter.send(source.chat_id, content, metadata=metadata)
+        except Exception as exc:
+            logger.debug("ambient gate timeout notice failed: %s", exc)
+
+    async def _request_feishu_bot_delegation_approval(self, event: MessageEvent) -> Optional[str]:
+        """Ask a human before allowing a Feishu bot-to-bot request to use tools."""
+        source = event.source
+        key = self._feishu_bot_delegation_key(source)
+        self._clear_stale_feishu_bot_delegation(key)
+        try:
+            from gateway.ambient_gate import infer_bot_delegation_sender_name
+
+            sender_name = infer_bot_delegation_sender_name(
+                source.user_name or source.user_id or "",
+                event.text or "",
+                "另一个 bot",
+            )
+        except Exception:
+            sender_name = (source.user_name or "").strip() or "另一个 bot"
+        pending = self._pending_feishu_bot_delegations_map()
+        pending[key] = {
+            "event": event,
+            "created_at": time.time(),
+            "sender_name": sender_name,
+        }
+        try:
+            from gateway.ambient_gate import build_bot_delegation_approval_prompt
+
+            text_prompt = build_bot_delegation_approval_prompt(
+                sender_name,
+                event.text or "",
+                include_text_fallback=True,
+            )
+            card_prompt = build_bot_delegation_approval_prompt(
+                sender_name,
+                event.text or "",
+                include_text_fallback=False,
+            )
+        except Exception:
+            text_prompt = (
+                "另一个 bot 提议我介入处理。需要人类确认后我才会调用工具开始排查。\n"
+                "同意请回复 `/approve`；拒绝请回复 `/deny`。"
+            )
+            card_prompt = "另一个 bot 提议我介入处理。需要人类确认后我才会调用工具开始排查。"
+
+        adapter = self.adapters.get(source.platform)
+        if adapter is not None and callable(getattr(adapter, "send_bot_delegation_approval", None)):
+            from tools import slash_confirm as _slash_confirm_mod
+
+            session_key = self._session_key_for_source(source)
+            counter = getattr(self, "_slash_confirm_counter", None)
+            if counter is None:
+                import itertools as _itertools
+
+                counter = _itertools.count(1)
+                self._slash_confirm_counter = counter
+            confirm_id = f"bot-{next(counter)}"
+
+            async def _on_confirm(choice: str):
+                mapped_choice = "cancel" if choice == "cancel" else "approve"
+                return await self._resolve_feishu_bot_delegation_key(
+                    key,
+                    mapped_choice,
+                    approver_name="a human in the group",
+                    approver_id="button",
+                )
+
+            _slash_confirm_mod.register(session_key, confirm_id, "bot-delegation", _on_confirm)
+            metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+            try:
+                result = await adapter.send_bot_delegation_approval(
+                    chat_id=source.chat_id,
+                    title="确认 bot 协作排查",
+                    message=card_prompt,
+                    session_key=session_key,
+                    confirm_id=confirm_id,
+                    metadata=metadata,
+                )
+                if result and getattr(result, "success", False):
+                    return None
+            except Exception as exc:
+                logger.debug("send_bot_delegation_approval failed on Feishu: %s", exc)
+            _slash_confirm_mod.clear(session_key)
+
+        return text_prompt
+
+    async def _resolve_feishu_bot_delegation_approval(
+        self,
+        event: MessageEvent,
+        choice: str,
+    ) -> Optional[str]:
+        """Resolve a pending Feishu bot-to-bot delegation approval."""
+        key = self._feishu_bot_delegation_key(event.source)
+        return await self._resolve_feishu_bot_delegation_key(
+            key,
+            choice,
+            approver_name=event.source.user_name or event.source.user_id or "",
+            approver_id=event.source.user_id or "unknown",
+        )
+
+    async def _resolve_feishu_bot_delegation_key(
+        self,
+        key: str,
+        choice: str,
+        *,
+        approver_name: str = "",
+        approver_id: str = "unknown",
+    ) -> Optional[str]:
+        """Resolve a pending Feishu bot-to-bot delegation approval by chat key."""
+        pending = self._pending_feishu_bot_delegations_map()
+        entry = pending.pop(key, None)
+        if not entry:
+            return None
+        if time.time() - float(entry.get("created_at", 0) or 0) > 300.0:
+            return "审批已过期，未启动排查。"
+        if choice != "approve":
+            return "已取消，不会启动这次 bot-to-bot 排查。"
+
+        original_event = entry.get("event")
+        if not isinstance(original_event, MessageEvent):
+            return "审批记录已失效，未启动排查。"
+
+        try:
+            from gateway.ambient_gate import build_approved_bot_delegation_prompt
+
+            approval_prompt = build_approved_bot_delegation_prompt(approver_name)
+        except Exception:
+            approval_prompt = "A human approved this Feishu bot-to-bot delegation. Proceed with normal tools."
+
+        approved_event = dataclasses.replace(
+            original_event,
+            channel_prompt=(
+                f"{original_event.channel_prompt}\n\n{approval_prompt}"
+                if original_event.channel_prompt else approval_prompt
+            ),
+        )
+        setattr(approved_event, "_feishu_bot_delegation_approved", True)
+        setattr(approved_event, "_ambient_response_mode", False)
+        logger.info(
+            "Feishu bot delegation approved by user=%s chat=%s bot_sender=%s",
+            approver_id or "unknown",
+            key,
+            getattr(original_event.source, "user_id", "") or "unknown",
+        )
+        result = await self._handle_message(approved_event)
+        return result or "已批准，但没有产生可发送的回复。"
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6081,6 +6338,30 @@ class GatewayRunner:
                     # itself will produce the next user-facing message.
                     return ""
 
+        # Human approval for Feishu bot-to-bot delegation.  The pending request
+        # is keyed by chat/thread rather than sender session so a human in the
+        # group can approve work proposed by one bot for another bot.
+        if (
+            source.platform == Platform.FEISHU
+            and not getattr(source, "is_bot", False)
+        ):
+            _bot_delegation_choice = self._match_feishu_bot_delegation_approval_choice(event)
+            if _bot_delegation_choice is not None:
+                _tool_approval_live_for_human = False
+                try:
+                    from tools.approval import has_blocking_approval as _has_blocking_approval
+
+                    _tool_approval_live_for_human = _has_blocking_approval(_quick_key)
+                except Exception:
+                    _tool_approval_live_for_human = False
+                if not _tool_approval_live_for_human:
+                    _delegation_result = await self._resolve_feishu_bot_delegation_approval(
+                        event,
+                        _bot_delegation_choice,
+                    )
+                    if _delegation_result is not None:
+                        return _delegation_result
+
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
         # /approve, /always, /cancel (plus short aliases).  Anything else
@@ -6124,6 +6405,84 @@ class GatewayRunner:
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        # Feishu ambient listening: after the platform has been allowed to
+        # receive ordinary group messages, each bot still decides whether the
+        # message is relevant to its own identity before starting the main
+        # agent.  Irrelevant/uncertain messages are silent and do not
+        # interrupt a running turn.
+        try:
+            from gateway.ambient_gate import (
+                build_ambient_channel_prompt as _build_ambient_channel_prompt,
+                evaluate_ambient_relevance as _evaluate_ambient_relevance,
+                is_feishu_ambient_candidate as _is_feishu_ambient_candidate,
+                load_ambient_gate_config as _load_ambient_gate_config,
+            )
+        except Exception:
+            _build_ambient_channel_prompt = None
+            _is_feishu_ambient_candidate = None
+            _evaluate_ambient_relevance = None
+            _load_ambient_gate_config = None
+        if (
+            _is_feishu_ambient_candidate is not None
+            and _evaluate_ambient_relevance is not None
+            and _is_feishu_ambient_candidate(event)
+        ):
+            _ambient_decision = await _evaluate_ambient_relevance(event)
+            logger.info(
+                "ambient gate: platform=feishu chat=%s user=%s decision=%s confidence=%.2f reason=%s",
+                source.chat_id or "unknown",
+                source.user_id or "unknown",
+                _ambient_decision.decision,
+                _ambient_decision.confidence,
+                _ambient_decision.reason or "",
+            )
+            if not _ambient_decision.should_respond:
+                if (
+                    _load_ambient_gate_config is not None
+                    and bool(getattr(_ambient_decision, "is_timeout_error", False))
+                ):
+                    try:
+                        _ambient_cfg = _load_ambient_gate_config()
+                        if getattr(_ambient_cfg, "timeout_notice", True):
+                            await self._maybe_send_ambient_gate_timeout_notice(
+                                event,
+                                _ambient_decision,
+                                min_interval_seconds=getattr(
+                                    _ambient_cfg,
+                                    "timeout_notice_min_interval_seconds",
+                                    60.0,
+                                ),
+                            )
+                    except Exception as exc:
+                        logger.debug("ambient gate timeout notice check failed: %s", exc)
+                return None
+            _ambient_prompt = (
+                _build_ambient_channel_prompt(_ambient_decision)
+                if _build_ambient_channel_prompt is not None
+                else "Ambient relevance gate approved this non-@ group message for your role."
+            )
+            event = dataclasses.replace(
+                event,
+                channel_prompt=(
+                    f"{event.channel_prompt}\n\n{_ambient_prompt}"
+                    if event.channel_prompt else _ambient_prompt
+                ),
+            )
+            setattr(event, "_ambient_response_mode", True)
+            source = event.source
+
+        # Feishu bot-to-bot traffic is useful for lightweight coordination, but
+        # must not cascade into full tool-using runs just because one bot
+        # @mentions another after an ambient human message.  Ask a human to
+        # approve before running the delegated work with normal tools.
+        if (
+            source.platform == Platform.FEISHU
+            and getattr(source, "is_bot", False)
+            and not event.is_command()
+            and not getattr(event, "_feishu_bot_delegation_approved", False)
+        ):
+            return await self._request_feishu_bot_delegation_approval(event)
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -7809,6 +8168,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                ambient_response_mode=bool(getattr(event, "_ambient_response_mode", False)),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -14678,6 +15038,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        ambient_response_mode: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14719,6 +15080,13 @@ class GatewayRunner:
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        if ambient_response_mode:
+            logger.info(
+                "ambient response mode: disabling tools for platform=%s chat=%s",
+                platform_key,
+                source.chat_id or "unknown",
+            )
+            enabled_toolsets = []
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -16594,6 +16962,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    ambient_response_mode=bool(getattr(pending_event, "_ambient_response_mode", False)),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
